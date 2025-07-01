@@ -1,9 +1,9 @@
 #!/bin/bash
-# GCP TIDSOC ICS Infrastructure Setup (Production Ready)
+# GCP TIDSOC ICS Infrastructure Setup (Single VPC - Production Ready)
 
-# Configuration - Variables
-PROJECT_ID="kinetic-magnet-464617-a5" # Replace with GCP project ID
-VPC_NAME="TIDSOC-VPC"
+# Configuration - Single VPC Architecture
+PROJECT_ID="kinetic-magnet-464617-a5"
+VPC_NAME="tidsoc-vpc"
 REGION="us-east1"
 MGMT_SUBNET="management-subnet"
 MGMT_CIDR="10.10.1.0/24"
@@ -13,10 +13,10 @@ FIELD_SUBNET="field-devices-subnet"
 FIELD_CIDR="10.10.3.0/24"
 DMZ_SUBNET="ics-dmz-subnet"
 DMZ_CIDR="10.10.4.0/24"
-VM_NAME="TIDSOC-Network-Agent"
+VM_NAME="tidsoc-network-agent"
 VM_ZONE="us-east1-b"
 VM_TYPE="n2-standard-4"
-MY_IP=$(curl -s ifconfig.me)    # public IP for SSH access
+MY_IP=$(curl -s ifconfig.me)
 NETWORK_TAG="tidsoc-network-agent"
 
 # Set active project
@@ -82,6 +82,9 @@ declare -A ics_ports=(
   ["allow-iec104"]="tcp:2404"
   ["allow-mms"]="tcp:102"
   ["allow-enip"]="tcp:44818"
+  ["allow-http"]="tcp:80"
+  ["allow-https"]="tcp:443"
+  ["allow-api"]="tcp:5001"
 )
 
 for rule_name in "${!ics_ports[@]}"; do
@@ -113,61 +116,95 @@ else
     --target-tags=$NETWORK_TAG
 fi
 
-# SSH Key setup (CRITICAL FIX)
+# SSH Key setup
 echo "Setting up SSH access..."
 if [ ! -f ~/.ssh/id_rsa ]; then
     ssh-keygen -t rsa -b 2048 -f ~/.ssh/id_rsa -N ""
     echo "✓ SSH key generated"
 fi
 
-# VM creation with idempotency and SSH key (FIXED)
+# VM creation with SINGLE NIC (FIXED)
 echo "Checking VM: $VM_NAME"
 if gcloud compute instances describe $VM_NAME --zone=$VM_ZONE --project=$PROJECT_ID >/dev/null 2>&1; then
   echo "✓ VM $VM_NAME already exists"
 else
-  echo "Creating VM: $VM_NAME"
+  echo "Creating VM: $VM_NAME with single NIC"
+  
+  # Create startup script file
+  cat > /tmp/startup-script.sh << 'EOF'
+#!/bin/bash
+# Update system
+apt-get update
+apt-get install -y git jq python3-pip docker.io docker-compose curl
+
+# Enable and start Docker
+systemctl enable --now docker
+usermod -aG docker znm6
+
+# Configure IP forwarding for routing
+echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+sysctl -p
+
+# Create project directories
+mkdir -p /opt/network_agent/{data,logs,config}
+chown -R znm6:znm6 /opt/network_agent
+
+# Configure routing for all subnets through single interface
+cat > /etc/netplan/90-tidsoc.yaml << NETPLAN_EOF
+network:
+  version: 2
+  ethernets:
+    ens4:
+      dhcp4: true
+      routes:
+        - to: 10.10.2.0/24
+          via: 10.10.1.1
+        - to: 10.10.3.0/24
+          via: 10.10.1.1
+        - to: 10.10.4.0/24
+          via: 10.10.1.1
+NETPLAN_EOF
+netplan apply
+
+# Install BACnet tools
+pip3 install BAC0 pandas requests
+
+echo "VM setup completed" > /var/log/startup-complete.log
+EOF
+
   gcloud compute instances create $VM_NAME \
     --zone=$VM_ZONE \
     --machine-type=$VM_TYPE \
     --network-interface="subnet=$MGMT_SUBNET,private-network-ip=10.10.1.4" \
-    --network-interface="subnet=$SCADA_SUBNET,private-network-ip=10.10.2.4" \
     --image-project=ubuntu-os-cloud \
     --image-family=ubuntu-2204-lts \
     --tags=$NETWORK_TAG \
-    --metadata=ssh-keys="azureuser:$(cat ~/.ssh/id_rsa.pub)" \
-    --metadata=startup-script='#!/bin/bash
-      # Install basic tools
-      apt-get update
-      apt-get install -y git jq python3-pip docker.io docker-compose
-      systemctl enable --now docker
-      usermod -aG docker azureuser
-      # Configure dual NIC routing
-      echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-      sysctl -p
-      # Persistent route configuration
-      cat > /etc/netplan/90-tidsoc.yaml << EOF
-      network:
-        version: 2
-        ethernets:
-          ens4:
-            dhcp4: true
-          ens5:
-            dhcp4: true
-            routes:
-              - to: 10.10.3.0/24
-                via: 10.10.2.1
-              - to: 10.10.4.0/24
-                via: 10.10.2.1
-      EOF
-      netplan apply
-      # Create project directories
-      mkdir -p /opt/network_agent/{data,logs,config}
-      chown -R azureuser:azureuser /opt/network_agent'
+    --metadata=ssh-keys="znm6:$(cat ~/.ssh/id_rsa.pub)" \
+    --metadata-from-file=startup-script=/tmp/startup-script.sh
+    
+  # Clean up temp file
+  rm /tmp/startup-script.sh
 fi
 
 echo "=================================================="
 echo "PHASE 2: Network Configuration"
 echo "=================================================="
+
+# Create routes for network segmentation (single NIC routing)
+echo "Configuring network routes for single NIC architecture..."
+
+# Route for SCADA subnet
+if gcloud compute routes describe tidsoc-scada-route --project=$PROJECT_ID >/dev/null 2>&1; then
+  echo "✓ SCADA route already exists"
+else
+  echo "Creating route to SCADA subnet"
+  gcloud compute routes create tidsoc-scada-route \
+    --network=$VPC_NAME \
+    --destination-range=10.10.2.0/24 \
+    --next-hop-instance=$VM_NAME \
+    --next-hop-instance-zone=$VM_ZONE \
+    --priority=100
+fi
 
 # Route for field devices
 if gcloud compute routes describe tidsoc-field-route --project=$PROJECT_ID >/dev/null 2>&1; then
@@ -177,8 +214,9 @@ else
   gcloud compute routes create tidsoc-field-route \
     --network=$VPC_NAME \
     --destination-range=10.10.3.0/24 \
-    --next-hop-address=10.10.2.4 \
-    --priority=100
+    --next-hop-instance=$VM_NAME \
+    --next-hop-instance-zone=$VM_ZONE \
+    --priority=101
 fi
 
 # Route for DMZ
@@ -189,14 +227,15 @@ else
   gcloud compute routes create tidsoc-dmz-route \
     --network=$VPC_NAME \
     --destination-range=10.10.4.0/24 \
-    --next-hop-address=10.10.2.4 \
-    --priority=101
+    --next-hop-instance=$VM_NAME \
+    --next-hop-instance-zone=$VM_ZONE \
+    --priority=102
 fi
 
 # Get VM public IP
 VM_IP=$(gcloud compute instances describe $VM_NAME \
   --zone=$VM_ZONE \
-  --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+  --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null || echo "Not assigned")
 
 echo "=================================================="
 echo "DEPLOYMENT COMPLETE!"
@@ -208,45 +247,55 @@ echo "Field Devices Subnet: $FIELD_SUBNET ($FIELD_CIDR)"
 echo "DMZ Subnet: $DMZ_SUBNET ($DMZ_CIDR)"
 echo "VM Name: $VM_NAME"
 echo "Public IP: $VM_IP"
-echo "Management IP: 10.10.1.4"
-echo "Monitoring IP: 10.10.2.4"
+echo "Primary IP: 10.10.1.4 (Management)"
+echo ""
+echo "Network Architecture: Single NIC with routing"
+echo "All subnets accessible through management interface"
 echo ""
 echo "SSH to VM:"
 echo "gcloud compute ssh $VM_NAME --zone=$VM_ZONE"
-echo "Or: ssh azureuser@$VM_IP"
+echo "Or: ssh znm6@$VM_IP"
 echo "=================================================="
 
 # Save deployment info
-cat > gcp-deployment-info.txt << EOF
-GCP TIDSOC ICS Deployment
-==========================
+cat > ~/gcp-deployment-info.txt << EOF
+GCP TIDSOC ICS Deployment (Single VPC)
+======================================
 Project ID: $PROJECT_ID
 Region: $REGION
 Zone: $VM_ZONE
 VPC: $VPC_NAME
 
 Subnets:
-- $MGMT_SUBNET: $MGMT_CIDR
-- $SCADA_SUBNET: $SCADA_CIDR
-- $FIELD_SUBNET: $FIELD_CIDR
-- $DMZ_SUBNET: $DMZ_CIDR
+- $MGMT_SUBNET: $MGMT_CIDR (Primary)
+- $SCADA_SUBNET: $SCADA_CIDR (Routed)
+- $FIELD_SUBNET: $FIELD_CIDR (Routed)
+- $DMZ_SUBNET: $DMZ_CIDR (Routed)
 
 Virtual Machine:
 - Name: $VM_NAME
 - Public IP: $VM_IP
-- Management IP: 10.10.1.4
-- Monitoring IP: 10.10.2.4
+- Primary IP: 10.10.1.4
+- Architecture: Single NIC with routing
 
-Firewall Rules:
-- SSH access from: $MY_IP
-- ICS Protocols: ${!ics_ports[@]}
+Network Access:
+- Management: Direct (10.10.1.4)
+- SCADA/HMI: Routed via 10.10.1.4
+- Field Devices: Routed via 10.10.1.4
+- DMZ: Routed via 10.10.1.4
 
 Connect:
 gcloud compute ssh $VM_NAME --zone=$VM_ZONE
-SSH Command: ssh azureuser@$VM_IP
+SSH Command: ssh znm6@$VM_IP
+
+Next Steps:
+1. SSH into VM and verify routing: ip route
+2. Test network connectivity to all subnets
+3. Deploy BACnet agent code
+4. Configure Snort for network monitoring
 EOF
 
-echo "Deployment information saved to gcp-deployment-info.txt"
+echo "Deployment information saved to ~/gcp-deployment-info.txt"
 
 # Verification commands
 echo ""
@@ -261,10 +310,13 @@ echo ""
 echo "2. Test SSH connectivity:"
 echo "   gcloud compute ssh $VM_NAME --zone=$VM_ZONE"
 echo ""
-echo "3. Verify dual NICs on VM:"
-echo "   gcloud compute ssh $VM_NAME --zone=$VM_ZONE --command='ip addr show'"
+echo "3. Verify network interface and routing:"
+echo "   gcloud compute ssh $VM_NAME --zone=$VM_ZONE --command='ip addr show && ip route'"
 echo ""
 echo "4. Check firewall rules:"
 echo "   gcloud compute firewall-rules list --filter='network:$VPC_NAME'"
+echo ""
+echo "5. Test BACnet port accessibility:"
+echo "   gcloud compute ssh $VM_NAME --zone=$VM_ZONE --command='sudo netstat -tulpn | grep 47808'"
 echo ""
 echo "=================================================="
